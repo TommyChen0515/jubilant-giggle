@@ -1,6 +1,10 @@
-# HaGeZi Multi ULTIMATE - Surge DOMAIN-SET
+# Title: HaGeZi's Ultimate DNS Blocklist (Surge DOMAIN-SET)
 # Source: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
-# Updated: 2026-10-15 14:07 UTC
+# Upstream version: 2026.1015.0909.01
+# Last modified: 15 Oct 2026 14:17 UTC
+# Syntax: Surge DOMAIN-SET
+# Number of entries: 235778
+#
 .0--4.com
 .0--d.com
 .0-0-0-0-0-0-0-0-0-0-0-0-0-18-0-0-0-0-0-0-0-0-0-0-0-0-0.info
