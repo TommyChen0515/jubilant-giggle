@@ -1,0 +1,65 @@
+name: Auto Update HaGeZi Ultimate for Surge
+
+# Trigger rules
+on:
+  schedule:
+    - cron: '0 20 * * *'   # Every day at 20:00 UTC (GitHub always uses UTC)
+  workflow_dispatch:        # Adds a "Run workflow" button for manual runs
+
+jobs:
+  update-rules:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write       # Lets the bot commit to your repo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: Download and Convert Rules
+        run: |
+          set -euo pipefail   # Stop immediately if any command fails
+
+          URL="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt"
+
+          echo "Downloading HaGeZi Ultimate wildcard domains..."
+          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o raw_ultimate.txt
+
+          echo "Converting to Surge DOMAIN-SET format..."
+          {
+            echo "# HaGeZi Multi ULTIMATE - Surge DOMAIN-SET"
+            echo "# Source: $URL"
+            echo "# Updated: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            awk '!/^#/ && NF {
+              d = $1
+              sub(/\r$/, "", d)        # strip Windows line endings
+              sub(/^\*?\./, "", d)     # strip any leading "*." or "."
+              if (d != "") print "." d # ".example.com" = domain + all subdomains
+            }' raw_ultimate.txt | sort -u
+          } > hagezi_ultimate.list
+
+          echo "Safety check..."
+          COUNT=$(grep -c '^\.' hagezi_ultimate.list || true)
+          echo "Total domains: $COUNT"
+          if [ "$COUNT" -lt 100000 ]; then
+            echo "❌ Too few domains ($COUNT). Download probably failed. Aborting."
+            exit 1
+          fi
+
+          rm raw_ultimate.txt
+
+      - name: Commit and Push Changes
+        run: |
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add hagezi_ultimate.list
+            git commit -m "Auto-update HaGeZi Ultimate: $(date -u +'%Y-%m-%d')"
+            git pull --rebase
+            git push
+            echo "✅ Rules updated and pushed!"
+          else
+            echo "🤷‍♂️ No changes, nothing to push."
+          fi
