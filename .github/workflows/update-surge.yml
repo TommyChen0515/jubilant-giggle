@@ -3,12 +3,22 @@ name: Auto Update HaGeZi Ultimate for Surge
 # Trigger rules
 on:
   schedule:
-    - cron: '0 20 * * *'   # Every day at 20:00 UTC (GitHub always uses UTC)
+    # HaGeZi's build mirror publishes a new build roughly every 4-8h
+    # (around 03:00, 11:00 and 19:00 UTC). GitHub/GitLab/Codeberg update once a day (~11:00 UTC).
+    # Runs every 2 hours at an odd minute so each new build is picked up soon after it's published,
+    # and to avoid GitHub's busy top-of-the-hour slots.
+    - cron: '23 */2 * * *'
   workflow_dispatch:        # Adds a "Run workflow" button for manual runs
+
+# Never let two runs overlap (e.g. a manual run during a scheduled one)
+concurrency:
+  group: hagezi-ultimate-update
+  cancel-in-progress: false
 
 jobs:
   update-rules:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     permissions:
       contents: write       # Lets the bot commit to your repo
@@ -17,61 +27,164 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v5
 
-      - name: Download and Convert Rules
+      - name: Download (with fallback) and Convert Rules
+        id: convert
         run: |
-          set -euo pipefail   # Stop immediately if any command fails
+          set -euo pipefail   # Stop immediately if any unexpected command fails
 
-          URL="https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt"
+          FILE_PATH="wildcard/ultimate-onlydomains.txt"
+          OUT="hagezi_ultimate.list"
+          MIN_COUNT=100000    # Ultimate has ~200k+ entries; anything far below means a bad download
+          MAX_BAD=1000        # Max lines allowed that don't look like domains
 
-          echo "Downloading HaGeZi Ultimate wildcard domains..."
-          curl -fsSL --retry 3 --retry-delay 5 "$URL" -o raw_ultimate.txt
+          # Sources in priority order: "Name|URL"
+          # 1st = build mirror (freshest), then official repo + mirrors, jsDelivr CDN as last resort
+          SOURCES=(
+            "Build mirror (dnsbunker)|https://hagezi-mirror.dnsbunker.org/${FILE_PATH}"
+            "GitHub|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/${FILE_PATH}"
+            "GitLab|https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/${FILE_PATH}"
+            "Codeberg|https://codeberg.org/hagezi/mirror2/raw/branch/main/dns-blocklists/${FILE_PATH}"
+            "jsDelivr|https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/${FILE_PATH}"
+          )
 
-          echo "Converting to Surge DOMAIN-SET format..."
-          awk '!/^#/ && NF {
-            d = $1
-            sub(/\r$/, "", d)        # strip Windows line endings
-            sub(/^\*?\./, "", d)     # strip any leading "*." or "."
-            if (d != "") print "." d # ".example.com" = domain + all subdomains
-          }' raw_ultimate.txt | sort -u > body.tmp
+          USED_NAME=""
+          USED_URL=""
+          COUNT=0
 
-          # Count rules
-          COUNT=$(grep -c '^\.' body.tmp || true)
-          echo "Total domains: $COUNT"
+          for entry in "${SOURCES[@]}"; do
+            name="${entry%%|*}"
+            url="${entry#*|}"
+            echo "::group::Trying source: $name"
+            echo "URL: $url"
+            rm -f raw.txt body.tmp
 
-          echo "Safety check..."
-          if [ "$COUNT" -lt 100000 ]; then
-            echo "❌ Too few domains ($COUNT). Download probably failed. Aborting."
+            # 1) Download (fail on HTTP errors, retry transient errors, hard time limits)
+            if ! curl -fsSL \
+                  --retry 3 --retry-delay 5 --retry-all-errors \
+                  --connect-timeout 15 --max-time 180 \
+                  -A "Mozilla/5.0 (GitHub Actions; Surge DOMAIN-SET converter)" \
+                  "$url" -o raw.txt; then
+              echo "⚠️ $name: download failed, trying next source."
+              echo "::endgroup::"; continue
+            fi
+
+            # 2) Reject HTML error/captcha pages served with HTTP 200
+            if head -c 2048 raw.txt | grep -qiE '<(!doctype|html|head|body)'; then
+              echo "⚠️ $name: received HTML instead of a blocklist, trying next source."
+              echo "::endgroup::"; continue
+            fi
+
+            # 3) Convert to Surge DOMAIN-SET (".example.com" = domain + all subdomains)
+            awk '!/^#/ && NF {
+              d = $1
+              sub(/\r$/, "", d)        # strip Windows line endings
+              sub(/^\*?\./, "", d)     # strip any leading "*." or "."
+              if (d != "") print "." d
+            }' raw.txt | sort -u > body.tmp
+
+            # 4) Validate entry count
+            count=$(grep -c '^\.' body.tmp || true)
+            if [ "$count" -lt "$MIN_COUNT" ]; then
+              echo "⚠️ $name: only $count entries (< $MIN_COUNT), trying next source."
+              echo "::endgroup::"; continue
+            fi
+
+            # 5) Validate that lines look like domains
+            bad=$(grep -cvE '^\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$' body.tmp || true)
+            if [ "$bad" -gt "$MAX_BAD" ]; then
+              echo "⚠️ $name: $bad malformed lines (> $MAX_BAD), trying next source."
+              echo "::endgroup::"; continue
+            fi
+
+            echo "✅ $name OK: $count entries ($bad unusual lines)"
+            USED_NAME="$name"
+            USED_URL="$url"
+            COUNT="$count"
+            echo "::endgroup::"
+            break
+          done
+
+          if [ -z "$USED_NAME" ]; then
+            echo "::error::All sources failed. Keeping the existing list unchanged."
+            rm -f raw.txt body.tmp
             exit 1
           fi
 
-          # Pull upstream version from HaGeZi's header (blank if not found)
-          UPSTREAM_VERSION=$(grep -m1 -i '^# Version:' raw_ultimate.txt | sed 's/^# Version:[[:space:]]*//I' | tr -d '\r' || true)
+          # Upstream version from HaGeZi's header (blank if not found)
+          UPSTREAM_VERSION=$(grep -m1 -i '^# Version:' raw.txt | sed 's/^# Version:[[:space:]]*//I' | tr -d '\r' || true)
+          UPSTREAM_VERSION="${UPSTREAM_VERSION:-unknown}"
 
-          echo "Writing final file with header..."
+          CHANGED=true
+
+          if [ -f "$OUT" ]; then
+            # Don't downgrade: a fallback mirror may be older than the build we already published
+            OLD_VERSION=$(grep -m1 '^# Upstream version:' "$OUT" | sed 's/^# Upstream version:[[:space:]]*//' || true)
+            if [ -n "$OLD_VERSION" ] && [ "$OLD_VERSION" != "unknown" ] && [ "$UPSTREAM_VERSION" != "unknown" ] \
+               && [ "$OLD_VERSION" != "$UPSTREAM_VERSION" ]; then
+              NEWEST=$(printf '%s\n%s\n' "$OLD_VERSION" "$UPSTREAM_VERSION" | sort -V | tail -n1)
+              if [ "$NEWEST" = "$OLD_VERSION" ]; then
+                echo "ℹ️ Fetched version ($UPSTREAM_VERSION) is older than published ($OLD_VERSION). Keeping current list."
+                CHANGED=false
+              fi
+            fi
+
+            # Skip rewriting if the domain list itself is identical (avoids timestamp-only commits)
+            if [ "$CHANGED" = true ] && grep -v '^#' "$OUT" | cmp -s - body.tmp; then
+              echo "ℹ️ Domain list unchanged. Nothing to update."
+              CHANGED=false
+            fi
+          fi
+
+          if [ "$CHANGED" = true ]; then
+            echo "Writing final file with header..."
+            {
+              echo "# Title: HaGeZi's Ultimate DNS Blocklist (Surge DOMAIN-SET)"
+              echo "# Source: $USED_NAME"
+              echo "# Source URL: $USED_URL"
+              echo "# Upstream version: $UPSTREAM_VERSION"
+              echo "# Last modified: $(date -u +'%d %b %Y %H:%M UTC')"
+              echo "# Syntax: Surge DOMAIN-SET"
+              echo "# Number of entries: $COUNT"
+              echo "#"
+              cat body.tmp
+            } > "$OUT"
+          fi
+
+          rm -f raw.txt body.tmp
+
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+
+          # Summary shown on the workflow run page
           {
-            echo "# Title: HaGeZi's Ultimate DNS Blocklist (Surge DOMAIN-SET)"
-            echo "# Source: $URL"
-            echo "# Upstream version: ${UPSTREAM_VERSION:-unknown}"
-            echo "# Last modified: $(date -u +'%d %b %Y %H:%M UTC')"
-            echo "# Syntax: Surge DOMAIN-SET"
-            echo "# Number of entries: $COUNT"
-            echo "#"
-            cat body.tmp
-          } > hagezi_ultimate.list
-
-          rm raw_ultimate.txt body.tmp
+            echo "### HaGeZi Ultimate → Surge"
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Source used | $USED_NAME |"
+            echo "| Upstream version | $UPSTREAM_VERSION |"
+            echo "| Entries | $COUNT |"
+            echo "| File updated | $CHANGED |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit and Push Changes
+        if: steps.convert.outputs.changed == 'true'
         run: |
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          if [ -n "$(git status --porcelain)" ]; then
-            git add hagezi_ultimate.list
-            git commit -m "Auto-update HaGeZi Ultimate: $(date -u +'%Y-%m-%d')"
-            git pull --rebase
-            git push
-            echo "✅ Rules updated and pushed!"
-          else
+          git add hagezi_ultimate.list
+          if git diff --cached --quiet; then
             echo "🤷‍♂️ No changes, nothing to push."
+            exit 0
           fi
+
+          git commit -m "Auto-update HaGeZi Ultimate ${{ steps.convert.outputs.version }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+
+          # Retry push in case another commit landed in between
+          for i in 1 2 3; do
+            git pull --rebase && git push && { echo "✅ Rules updated and pushed!"; exit 0; }
+            echo "Push attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Failed to push after 3 attempts."
+          exit 1
