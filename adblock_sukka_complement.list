@@ -1,15 +1,16 @@
-# Title: Ad-Block complement to Sukka's rulesets (Surge RULE-SET)
+# Title: Ad-Block complement to Sukka's rulesets - main set (Surge RULE-SET)
 # Description: (HaGeZi Ultimate + blackmatrix7 Advertising_All + mickeu
 #              Advertising_Supplement + 217heidai adblocksurge) minus every rule
 #              already covered by Sukka's reject / reject_extra / reject-url-regex
 #              / reject-no-drop / reject-drop / ip reject rulesets.
-# Last modified: 05 Nov 2026 01:22 UTC
-# Usage: put this line AFTER all of Sukka's ad-block rulesets:
+# Last modified: 05 Nov 2026 01:52 UTC
+# Usage: place AFTER all of Sukka's ad-block rulesets:
 #   RULE-SET,https://raw.githubusercontent.com/TommyChen0515/jubilant-giggle/main/adblock_sukka_complement.list,REJECT
-# The MITM hostnames for the URL-REGEX rules below live in
-# adblock_sukka_complement_mitm.sgmodule - install that module to enable them on HTTPS.
-# Entries: DOMAIN: 13543, DOMAIN-SUFFIX: 263299, DOMAIN-KEYWORD: 215, AND: 1, URL-REGEX: 12, IP-CIDR (no-resolve): 342
-# Number of entries: 277412
+# All entries here are domain/IP/logical/port rules, so this set may also
+# carry the pre-matching flag (REJECT-family policy required).
+# Companion file (URL-REGEX etc., cannot use pre-matching): adblock_sukka_complement_extra.list
+# Entries: DOMAIN: 13543, DOMAIN-SUFFIX: 263299, DOMAIN-KEYWORD: 215, AND: 1, IP-CIDR (no-resolve): 342
+# Number of entries: 277400
 #
 DOMAIN,0.code.cotsta.ru
 DOMAIN,00-gov.cn
@@ -277069,18 +277070,6 @@ DOMAIN-KEYWORD,xxshuyuan
 DOMAIN-KEYWORD,ynuf.alipay.com
 DOMAIN-KEYWORD,zjtoolbar
 AND,((USER-AGENT,Frodo*),(DOMAIN,119.29.29.29))
-URL-REGEX,^https?:\/\/.+?\.beacon\.qq\.com
-URL-REGEX,^https?:\/\/.+?\.l\.qq\.com
-URL-REGEX,^https?:\/\/\w+\.gdt\.qq\.com
-URL-REGEX,^https?:\/\/ad\d\.sina\.com
-URL-REGEX,^https?:\/\/ad\d\.sina\.com.cn
-URL-REGEX,^https?:\/\/app\.58\.com\/api\/log\/
-URL-REGEX,^https?:\/\/cdn-1rtb\.caiyunapp\.com/creative/.*$
-URL-REGEX,^https?:\/\/d\d.sinaimg.cn
-URL-REGEX,^https?:\/\/goblin\.hupu\.com/[^/]+/[^/]+\/interfaceAd\/
-URL-REGEX,^https?:\/\/sa\d\.tuisong\.baidu\.com
-URL-REGEX,^https?:\/\/sax\w?\.sina\.com\.cn
-URL-REGEX,^https?:\/\/update\.pan\.baidu\.com\/statistics
 IP-CIDR,1.3.0.10/32,no-resolve
 IP-CIDR,10.10.34.34/32,no-resolve
 IP-CIDR,10.10.34.35/32,no-resolve
