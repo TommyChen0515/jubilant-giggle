@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
 Build Surge rulesets from HaGeZi Ultimate + blackmatrix7 + mickeu + 217heidai,
-and subtract everything already covered by Sukka's ad-block rulesets.
+then subtract everything already covered by Sukka's ad-block rulesets.
 
-Outputs (all written to the repo root):
-  hagezi_ultimate.list                    Surge DOMAIN-SET
-  adblock_merged.list                     Surge RULE-SET  (HaGeZi + b + c + d)
-  adblock_sukka_complement.list           Surge RULE-SET  (merged - Sukka)
-  adblock_sukka_complement_mitm.sgmodule  Surge module    ([MITM] %APPEND% hostnames)
+Published outputs (repo root):
+  hagezi_ultimate.list                     Surge DOMAIN-SET
+  adblock_merged.list                      Surge RULE-SET  (HaGeZi + b + c + d)
+  adblock_sukka_complement.list            Surge RULE-SET  (merged - Sukka),
+                                           containing only types eligible for
+                                           pre-matching
+  adblock_sukka_complement_extra.list      Surge RULE-SET  (URL-REGEX / USER-AGENT /
+                                           PROCESS-NAME / PROTOCOL - NOT eligible
+                                           for pre-matching, kept separate)
+  adblock_sukka_complement_mitm.sgmodule   Surge module, [MITM] %APPEND% hostnames
+                                           for the URL-REGEX rules above
 
-Only the Python standard library is used. Every file is validated against
-Surge's documented syntax before anything is written; any validation failure
-aborts the run with the previously published files left untouched.
+Standard library only. Every file is validated against Surge's documented
+rule-set syntax before anything is written; any validation failure aborts the
+run and leaves previously published files untouched.
 """
 
 from __future__ import annotations
@@ -23,18 +29,19 @@ import re
 import sys
 from datetime import datetime, timezone
 
-# --------------------------------------------------------------------------- paths
+# --------------------------------------------------------------------- outputs
 CACHE = "cache"
 OUT_HAGEZI = "hagezi_ultimate.list"
 OUT_MERGED = "adblock_merged.list"
 OUT_COMPLEMENT = "adblock_sukka_complement.list"
+OUT_COMPLEMENT_EXTRA = "adblock_sukka_complement_extra.list"
 OUT_MODULE = "adblock_sukka_complement_mitm.sgmodule"
 
-# --------------------------------------------------------------------------- gates
-HAGEZI_MAX_UNUSUAL = 1000       # tolerance copied from the original workflow
-SUKKA_MIN_DOMAINS = 150000      # reject(~148k) + reject_extra(~81k) today
-MERGED_MIN_RULES = 150000       # guards against a silently broken parser
-COMPLEMENT_MIN_RULES = 40000    # guards against over-aggressive subtraction
+# ----------------------------------------------------------------------- gates
+HAGEZI_MAX_UNUSUAL = 1000
+SUKKA_MIN_DOMAINS = 150000
+MERGED_MIN_RULES = 150000
+COMPLEMENT_MIN_RULES = 40000
 MODULE_MAX_HOSTS = 5000
 
 HAGEZI_VERSION = (os.environ.get("HAGEZI_VERSION") or "unknown").strip() or "unknown"
@@ -43,27 +50,39 @@ HAGEZI_SRC_URL = (os.environ.get("HAGEZI_SRC_URL") or "-").strip() or "-"
 RAW_BASE = os.environ.get("RAW_BASE", "").rstrip("/")
 NOW = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
 
-# --------------------------------------------------------------------------- regexes
+# --------------------------------------------------------------------- regexes
 LABEL = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?$")
 STRICT_2PLUS = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 RULE_LINE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)[ \t]*,(.*)$")
 
-# Rule types that must never be copied verbatim into a published file.
+# Never copied verbatim: they reference other sets / carry their own policy.
 REF_TYPES = {"DOMAIN-SET", "RULE-SET", "FINAL", "LOGIC"}
 
-# Everything this script is allowed to emit. Anything else is dropped + counted.
-EMIT_TYPES = {
-    "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD",
-    "IP-CIDR", "IP-CIDR6", "URL-REGEX",
-    "AND", "OR", "NOT",
-    "USER-AGENT", "PROCESS-NAME", "PROTOCOL", "DEST-PORT", "SRC-PORT", "SRC-IP",
+DOMAIN_TYPES = {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD"}
+IP_TYPES = {"IP-CIDR", "IP-CIDR6"}
+LOGICAL_TYPES = {"AND", "OR", "NOT"}
+HTTP_TYPES = {"URL-REGEX", "USER-AGENT"}
+
+# Types we are willing to publish at all. Anything else is dropped + counted,
+# never silently mis-ordered.
+EMIT_TYPES = DOMAIN_TYPES | IP_TYPES | LOGICAL_TYPES | HTTP_TYPES | {
+    "PROCESS-NAME", "PROTOCOL", "DEST-PORT", "SRC-PORT", "SRC-IP",
 }
+
+# Types Surge accepts in the pre-matching phase (per REJECT policy docs).
+# URL-REGEX / USER-AGENT / PROCESS-NAME / PROTOCOL are absent on purpose.
+PREMATCH_TYPES = (DOMAIN_TYPES | IP_TYPES | LOGICAL_TYPES
+                  | {"DEST-PORT", "SRC-PORT", "SRC-IP"})
+
+# Per-line flags Surge allows inside a rule-set file.
+ALLOWED_LINE_FLAGS = {"extended-matching", "no-resolve"}
 
 stats: dict[str, dict[str, int]] = {}
 
 
 def st(key: str) -> dict[str, int]:
-    return stats.setdefault(key, {"lines": 0, "unusual": 0, "ips": 0, "skipped": 0})
+    return stats.setdefault(key, {"lines": 0, "unusual": 0, "ips": 0,
+                                  "skipped": 0, "flags": 0})
 
 
 def die(msg: str) -> None:
@@ -90,7 +109,7 @@ def gh_summary(md: str) -> None:
             f.write(md + "\n")
 
 
-# --------------------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- value helpers
 def as_ip(value: str):
     try:
         return ipaddress.ip_address(value.strip())
@@ -103,7 +122,6 @@ def ip_net(ip):
 
 
 def canon_host(value: str):
-    """Lower-case hostname, or None if it is not a plain domain."""
     v = value.strip().lower().rstrip(".")
     if not v or v.startswith(".") or any(c in v for c in " \t,\\'\"#%*?()[]"):
         return None
@@ -130,7 +148,7 @@ def iter_lines(path: str):
 
 def split_value_extra(raw: str):
     raw = raw.strip()
-    if raw.startswith("("):          # logical rule: keep the whole expression
+    if raw.startswith("("):
         return raw, ""
     i = raw.find(",")
     if i < 0:
@@ -138,18 +156,16 @@ def split_value_extra(raw: str):
     return raw[:i].strip(), raw[i + 1:].strip()
 
 
-# --------------------------------------------------------------------------- parsing
+# ---------------------------------------------------------------------- parsing
 def parse_rule(key: str, line: str, r: dict) -> None:
     m = RULE_LINE.match(line)
     if not m:
         st(key)["unusual"] += 1
         return
-    st(key)["lines"] += 1
     rtype = m.group(1).upper()
     rest = m.group(2).strip()
 
-    # URL-REGEX has no policy column in a rule-set file, and the pattern may
-    # legitimately contain commas -> take the whole remainder as the value.
+    # URL-REGEX has no policy column here and the pattern may contain commas.
     if rtype == "URL-REGEX":
         v = rest
         if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
@@ -163,8 +179,11 @@ def parse_rule(key: str, line: str, r: dict) -> None:
     value, extra = split_value_extra(rest)
 
     if rtype in ("DOMAIN", "DOMAIN-SUFFIX"):
+        if extra:
+            # per-line extended-matching / no-resolve: valid, not modelled per entry
+            st(key)["flags"] += 1
         ip = as_ip(value.strip().lstrip("."))
-        if ip is not None:                      # IP literal -> real IP rule
+        if ip is not None:
             r["ips"].add(ip_net(ip))
             st(key)["ips"] += 1
             return
@@ -185,7 +204,7 @@ def parse_rule(key: str, line: str, r: dict) -> None:
             r["wc"].add(v)
         else:
             st(key)["unusual"] += 1
-    elif rtype in ("IP-CIDR", "IP-CIDR6"):
+    elif rtype in IP_TYPES:
         try:
             net = ipaddress.ip_network(value.strip(), strict=False)
         except ValueError:
@@ -202,7 +221,8 @@ def parse_rule(key: str, line: str, r: dict) -> None:
         else:
             st(key)["unusual"] += 1
     else:
-        st(key)["unusual"] += 1                  # unknown type -> never published
+        st(key)["unusual"] += 1
+    st(key)["lines"] += 1
 
 
 def parse_ruleset_file(path: str, key: str, r: dict) -> None:
@@ -242,7 +262,7 @@ def parse_domain_file(path: str, key: str, r: dict, bare_as_suffix: bool) -> Non
         (r["suffix"] if suffix else r["exact"]).add(d)
 
 
-# --------------------------------------------------------------------------- set algebra
+# ------------------------------------------------------------------ set algebra
 def merge_rules(dst: dict, *srcs: dict) -> None:
     for s in srcs:
         for k in ("suffix", "exact", "kw", "wc", "ips", "other"):
@@ -260,7 +280,6 @@ def parent_in(d: str, sset: set, include_self: bool = False) -> bool:
 
 
 def collapse(r: dict) -> None:
-    """Drop entries already covered by a broader entry of the same list."""
     sf = {s for s in r["suffix"] if not parent_in(s, r["suffix"])}
     r["suffix"] = sf
     r["exact"] = {e for e in r["exact"] if e not in sf and not parent_in(e, sf)}
@@ -275,7 +294,7 @@ def total_rules(r: dict) -> int:
             + len(r["wc"]) + len(r["ips"]) + len(r["other"]))
 
 
-# --------------------------------------------------------------------------- rendering
+# -------------------------------------------------------------------- rendering
 def quote_value(v: str) -> str:
     return f'"{v}"' if "," in v else v
 
@@ -286,13 +305,14 @@ def render_rules(r: dict) -> list[str]:
     out += [f"DOMAIN-KEYWORD,{k}" for k in sorted(r["kw"])]
     out += [f"DOMAIN-WILDCARD,{w}" for w in sorted(r["wc"])]
 
-    logical = sorted((t, v) for (t, v, _e) in r["other"] if t in ("AND", "OR", "NOT"))
+    logical = sorted((t, v) for (t, v, _e) in r["other"] if t in LOGICAL_TYPES)
     passthru = sorted((t, v, e) for (t, v, e) in r["other"]
-                      if t not in ("AND", "OR", "NOT", "URL-REGEX"))
+                      if t not in LOGICAL_TYPES and t != "URL-REGEX")
     out += [f"{t},{v}" for t, v in logical]
     out += [f"{t},{quote_value(v)}" + (f",{e}" if e else "") for t, v, e in passthru]
 
-    # URL-REGEX before IP rules: no rule then forces a DNS lookup to be reached.
+    # URL-REGEX last: it is the most expensive type and must not sit before
+    # anything that forces a DNS lookup.
     out += [f"URL-REGEX,{quote_value(v)}"
             for (t, v, _e) in sorted(r["other"]) if t == "URL-REGEX"]
 
@@ -325,7 +345,7 @@ def counts_str(r: dict) -> str:
     return ", ".join(f"{t}: {n}" for t, n in counts(r))
 
 
-# --------------------------------------------------------------------------- validation
+# ------------------------------------------------------------------- validation
 def validate_rules_body(body: list[str], name: str) -> None:
     errors: list[str] = []
     for lineno, line in enumerate(body, 1):
@@ -339,17 +359,22 @@ def validate_rules_body(body: list[str], name: str) -> None:
         if rtype not in EMIT_TYPES:
             errors.append(f"{name}:{lineno}: rule type {rtype} not allowed")
             continue
-        if rtype in ("IP-CIDR", "IP-CIDR6"):
-            if not rest.endswith(",no-resolve") or rest.count(",") != 1:
+        if rtype in IP_TYPES:
+            parts = rest.split(",")
+            if len(parts) != 2 or parts[1].strip() != "no-resolve":
                 errors.append(f"{name}:{lineno}: IP rule must be '<net>,no-resolve': {line!r}")
-        elif rtype in ("DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD"):
-            if "," in rest:
-                errors.append(f"{name}:{lineno}: stray policy column: {line!r}")
-            if not rest.strip():
+        elif rtype in DOMAIN_TYPES:
+            parts = rest.split(",")
+            if not parts[0].strip():
                 errors.append(f"{name}:{lineno}: empty value: {line!r}")
+            for flag in parts[1:]:
+                if flag.strip() not in ALLOWED_LINE_FLAGS:
+                    errors.append(f"{name}:{lineno}: stray column {flag!r}: {line!r}")
         elif rtype == "URL-REGEX":
             if not rest.strip():
                 errors.append(f"{name}:{lineno}: empty URL-REGEX: {line!r}")
+            elif "," in rest and not (rest.startswith('"') and rest.endswith('"')):
+                errors.append(f"{name}:{lineno}: URL-REGEX with comma must be quoted: {line!r}")
     if errors:
         for e in errors[:20]:
             print(f"::error::{e}", flush=True)
@@ -364,17 +389,18 @@ def validate_domain_set(body: list[str], name: str) -> None:
         die(f"{name}: {len(bad)} invalid entries - nothing written")
 
 
-# --------------------------------------------------------------------------- MITM module
+# ------------------------------------------------------------------ MITM module
 TOK_ESC = re.compile(r"[A-Za-z0-9_-]+(?:\\\.[A-Za-z0-9_-]+)+")
 TOK_PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+")
-# Tokens ending in a file extension are not hostnames (e.g. "foo.js" in a path).
+
+# Extensions that are never TLDs, so a token ending in them is a file, not a host.
+# Deliberately excludes .zip / .mov / .sh etc. which are real TLDs.
 BAD_TLDS = {
     "js", "mjs", "css", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico",
     "json", "xml", "html", "htm", "php", "asp", "aspx", "jsp", "txt", "csv",
-    "mp4", "m3u8", "ts", "woff", "woff2", "ttf", "eot", "map", "gz", "zip",
-    "apk", "ipa", "bin", "dat", "swf", "webmanifest",
+    "mp4", "m3u8", "woff", "woff2", "ttf", "eot", "map", "gz", "apk", "ipa",
+    "bin", "dat", "swf", "webmanifest",
 }
-
 MITM_HOST_RE = re.compile(r"^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9_])?$")
 
 
@@ -391,13 +417,13 @@ def mitm_hostnames(regex_values: list[str]) -> set[str]:
             continue
         if labels[-1] in BAD_TLDS or len(labels[-1]) < 2:
             continue
-        if all(lbl.isdigit() for lbl in labels):        # IPv4 literal, not a hostname
+        if all(lbl.isdigit() for lbl in labels):
             continue
         if not all(LABEL.match(lbl) for lbl in labels):
             continue
         base = ".".join(labels)
         hosts.add(base)
-        hosts.add("*." + base)                          # cover subdomains too
+        hosts.add("*." + base)
     if len(hosts) > MODULE_MAX_HOSTS:
         warn(f"{len(hosts)} MITM hostnames derived; keeping the first {MODULE_MAX_HOSTS}")
         hosts = set(sorted(hosts)[:MODULE_MAX_HOSTS])
@@ -419,7 +445,7 @@ def write_module(urlregex_values: list[str]) -> tuple[str, set[str]]:
     hosts = mitm_hostnames(urlregex_values)
     if not hosts:
         warn("URL-REGEX rules present but no literal hostname could be derived - "
-             "those rules will only match plain HTTP until you add hostnames manually")
+             "those rules only match plain HTTP until hostnames are added manually")
         if os.path.exists(OUT_MODULE):
             os.remove(OUT_MODULE)
             return "deleted", set()
@@ -428,10 +454,10 @@ def write_module(urlregex_values: list[str]) -> tuple[str, set[str]]:
     content = "\n".join([
         "#!name=AdBlock Complement (Sukka) - URL-REGEX MITM",
         f"#!desc=Appends {len(hosts)} MITM hostname entries derived from the "
-        f"{len(urlregex_values)} URL-REGEX rules in adblock_sukka_complement.list, so those "
-        "rules can also match HTTPS requests. Install this module next to that RULE-SET, "
-        "and generate + trust a MITM CA certificate in Surge first "
-        "(Settings -> MitM -> Generate CA). Without the certificate the module does nothing.",
+        f"{len(urlregex_values)} URL-REGEX rules in {OUT_COMPLEMENT_EXTRA}, so those "
+        "rules can also match HTTPS. Requires a generated and trusted MITM CA "
+        "certificate (Surge -> MitM -> Generate CA). Without the certificate this "
+        "module does nothing, and certificate-pinning apps may fail to connect.",
         "#!category=Ad Blocking",
         "",
         "[MITM]",
@@ -482,12 +508,18 @@ def write_if_changed(path: str, header: list[str], body: list[str]) -> bool:
     return True
 
 
+def remove_if_empty(path: str, body: list[str]) -> None:
+    if not body and os.path.exists(path):
+        os.remove(path)
+        print(f"{path}: no rules left - removed")
+
+
 def version_key(v: str):
     return tuple((1, int(p)) if p.isdigit() else (0, p.lower())
                  for p in re.split(r"[._\-+ ]+", v))
 
 
-# --------------------------------------------------------------------------- main
+# ------------------------------------------------------------------------- main
 def main() -> None:
     required = ["hagezi.txt", "blackmatrix.list", "mickeu.list", "heidai.txt",
                 "sukka_ds_reject.conf", "sukka_ds_extra.conf", "sukka_nonip_reject.conf",
@@ -497,7 +529,6 @@ def main() -> None:
     if missing:
         die(f"missing downloaded file(s): {', '.join(missing)}")
 
-    # 0) never downgrade: a fallback mirror may be older than what is published
     old_ver = ""
     if os.path.isfile(OUT_HAGEZI):
         with open(OUT_HAGEZI, "r", encoding="utf-8", errors="replace") as f:
@@ -513,7 +544,7 @@ def main() -> None:
         gh_output(changed="false", version=HAGEZI_VERSION, merged_count=0, complement_count=0)
         return
 
-    # 1) parse every upstream list
+    # ---- parse ---------------------------------------------------------
     hagezi = new_rules()
     parse_domain_file(f"{CACHE}/hagezi.txt", "hagezi-ultimate", hagezi, True)
 
@@ -524,7 +555,7 @@ def main() -> None:
     parse_ruleset_file(f"{CACHE}/mickeu.list", "mickeu_Advertising_Supplement", mk)
 
     hd = new_rules()
-    # 217heidai ships a genuine DOMAIN-SET: bare entries are exact matches.
+    # 217heidai publishes a genuine DOMAIN-SET: bare entries are exact matches.
     parse_domain_file(f"{CACHE}/heidai.txt", "217heidai_adblocksurge", hd, False)
 
     sukka = new_rules()
@@ -536,7 +567,7 @@ def main() -> None:
     parse_ruleset_file(f"{CACHE}/sukka_nonip_drop.conf", "sukka/reject-drop", sukka)
     parse_ruleset_file(f"{CACHE}/sukka_ip_reject.conf", "sukka/reject_(ip)", sukka)
 
-    # 2) sanity gates before building anything
+    # ---- sanity --------------------------------------------------------
     hst = st("hagezi-ultimate")
     strict_bad = sum(1 for d in (hagezi["suffix"] | hagezi["exact"])
                      if not STRICT_2PLUS.match(d))
@@ -546,25 +577,25 @@ def main() -> None:
     if len(sukka["suffix"]) + len(sukka["exact"]) < SUKKA_MIN_DOMAINS:
         die("Sukka rulesets look truncated - aborting")
 
-    # 3) merged = HaGeZi + (b) + (c) + (d), de-duplicated
+    # ---- merged = HaGeZi + b + c + d -----------------------------------
     merged = new_rules()
     merge_rules(merged, hagezi, bm, mk, hd)
     collapse(merged)
 
-    # 4) complement = merged - everything Sukka already covers
+    # ---- complement = merged - Sukka -----------------------------------
     kw = list(sukka["kw"])
     wc_rx = [(w, re.compile(fnmatch.translate(w))) for w in sukka["wc"]]
     s_suf, s_ex, s_ips = sukka["suffix"], sukka["exact"], list(sukka["ips"])
 
     def covered_by_sukka(d: str, is_suffix: bool) -> bool:
-        if parent_in(d, s_suf, include_self=True):      # suffix covers d + subdomains
+        if parent_in(d, s_suf, include_self=True):
             return True
-        if not is_suffix and d in s_ex:                 # exact host already blocked
+        if not is_suffix and d in s_ex:
             return True
-        for k in kw:                                    # keyword in d => d and subs covered
+        for k in kw:
             if k in d:
                 return True
-        if not is_suffix:                               # wildcard matches the host itself
+        if not is_suffix:
             for _w, rx in wc_rx:
                 if rx.fullmatch(d):
                     return True
@@ -579,27 +610,35 @@ def main() -> None:
                    if not any(m.version == n.version and n.subnet_of(m) for m in s_ips)}
     comp["other"] = {o for o in merged["other"] if o not in sukka["other"]}
 
-    # 5) size gates
+    # Split out the types Surge cannot use in the pre-matching phase.
+    comp_extra = new_rules()
+    comp_extra["other"] = {o for o in comp["other"] if o[0] not in PREMATCH_TYPES}
+    comp["other"] = {o for o in comp["other"] if o[0] in PREMATCH_TYPES}
+
+    # ---- size gates ----------------------------------------------------
     if total_rules(merged) < MERGED_MIN_RULES:
         die(f"merged ruleset only has {total_rules(merged)} rules "
             f"(expected >= {MERGED_MIN_RULES}) - aborting")
-    if total_rules(comp) < COMPLEMENT_MIN_RULES:
-        die(f"complement only has {total_rules(comp)} rules "
-            f"(expected >= {COMPLEMENT_MIN_RULES}) - subtract logic may be wrong - aborting")
+    comp_total = total_rules(comp) + total_rules(comp_extra)
+    if comp_total < COMPLEMENT_MIN_RULES:
+        die(f"complement only has {comp_total} rules "
+            f"(expected >= {COMPLEMENT_MIN_RULES}) - subtraction may be wrong - aborting")
     leftover = (comp["suffix"] & s_suf) | (comp["exact"] & s_ex)
     if leftover:
         die(f"subtraction incomplete: {len(leftover)} rules still duplicate Sukka entries")
 
-    # 6) build bodies + validate BEFORE touching any published file
+    # ---- render + validate before touching anything --------------------
     hagezi_body = sorted("." + d for d in (hagezi["suffix"] | hagezi["exact"]))
     merged_body = render_rules(merged)
     comp_body = render_rules(comp)
+    comp_extra_body = render_rules(comp_extra)
 
     validate_domain_set(hagezi_body, OUT_HAGEZI)
     validate_rules_body(merged_body, OUT_MERGED)
     validate_rules_body(comp_body, OUT_COMPLEMENT)
+    validate_rules_body(comp_extra_body, OUT_COMPLEMENT_EXTRA)
 
-    # 7) write
+    # ---- write ---------------------------------------------------------
     ch_h = write_if_changed(OUT_HAGEZI, [
         "# Title: HaGeZi's Ultimate DNS Blocklist (Surge DOMAIN-SET)",
         f"# Source: {HAGEZI_SRC_NAME}",
@@ -621,39 +660,62 @@ def main() -> None:
         (f"# Usage: RULE-SET,{RAW_BASE}/{OUT_MERGED},REJECT" if RAW_BASE
          else "# Usage: point a RULE-SET rule at the raw URL of this file"),
         "# Notes: IP rules carry no-resolve; URL-REGEX rules only match plain HTTP",
-        "#        or MITM-decrypted HTTPS requests and are listed before IP rules.",
+        "#        or MITM-decrypted HTTPS requests.",
         f"# Entries: {counts_str(merged)}",
         f"# Number of entries: {len(merged_body)}",
         "#",
     ], merged_body)
 
     ch_c = write_if_changed(OUT_COMPLEMENT, [
-        "# Title: Ad-Block complement to Sukka's rulesets (Surge RULE-SET)",
+        "# Title: Ad-Block complement to Sukka's rulesets - main set (Surge RULE-SET)",
         "# Description: (HaGeZi Ultimate + blackmatrix7 Advertising_All + mickeu",
         "#              Advertising_Supplement + 217heidai adblocksurge) minus every rule",
         "#              already covered by Sukka's reject / reject_extra / reject-url-regex",
         "#              / reject-no-drop / reject-drop / ip reject rulesets.",
         f"# Last modified: {NOW}",
-        "# Usage: put this line AFTER all of Sukka's ad-block rulesets:",
+        "# Usage: place AFTER all of Sukka's ad-block rulesets:",
         (f"#   RULE-SET,{RAW_BASE}/{OUT_COMPLEMENT},REJECT" if RAW_BASE
-         else "#   RULE-SET,<raw URL of this file>,REJECT"),
-        "# The MITM hostnames for the URL-REGEX rules below live in",
-        f"# {OUT_MODULE} - install that module to enable them on HTTPS.",
+         else f"#   RULE-SET,<raw URL of {OUT_COMPLEMENT}>,REJECT"),
+        "# All entries here are domain/IP/logical/port rules, so this set may also",
+        "# carry the pre-matching flag (REJECT-family policy required).",
+        f"# Companion file (URL-REGEX etc., cannot use pre-matching): {OUT_COMPLEMENT_EXTRA}",
         f"# Entries: {counts_str(comp)}",
         f"# Number of entries: {len(comp_body)}",
         "#",
     ], comp_body)
 
-    urlregex = sorted(v for (t, v, _e) in comp["other"] if t == "URL-REGEX")
+    ch_x = False
+    if comp_extra_body:
+        ch_x = write_if_changed(OUT_COMPLEMENT_EXTRA, [
+            "# Title: Ad-Block complement to Sukka - extra rules (Surge RULE-SET)",
+            "# Description: URL-REGEX / USER-AGENT / PROCESS-NAME / PROTOCOL rules.",
+            "#              Surge does not allow these types in the pre-matching phase,",
+            "#              so they are kept in a separate set.",
+            f"# Last modified: {NOW}",
+            (f"# Usage: RULE-SET,{RAW_BASE}/{OUT_COMPLEMENT_EXTRA},REJECT" if RAW_BASE
+             else f"# Usage: RULE-SET,<raw URL of {OUT_COMPLEMENT_EXTRA}>,REJECT"),
+            f"# MITM hostnames for the URL-REGEX rules: {OUT_MODULE}",
+            f"# Entries: {counts_str(comp_extra)}",
+            f"# Number of entries: {len(comp_extra_body)}",
+            "#",
+        ], comp_extra_body)
+    else:
+        remove_if_empty(OUT_COMPLEMENT_EXTRA, comp_extra_body)
+        if os.path.exists(OUT_COMPLEMENT_EXTRA):
+            os.remove(OUT_COMPLEMENT_EXTRA)
+            ch_x = True
+            print(f"{OUT_COMPLEMENT_EXTRA}: no rules - removed")
+
+    urlregex = sorted(v for (t, v, _e) in comp_extra["other"] if t == "URL-REGEX")
     module_state, module_hosts = write_module(urlregex)
 
-    # 8) report
-    changed = ch_h or ch_m or ch_c or module_state in ("written", "deleted")
+    changed = ch_h or ch_m or ch_c or ch_x or module_state in ("written", "deleted")
     gh_output(changed=str(changed).lower(),
               version=HAGEZI_VERSION,
               merged_count=len(merged_body),
-              complement_count=len(comp_body))
+              complement_count=comp_total)
 
+    # ---- report --------------------------------------------------------
     md = ["### Surge ad-block ruleset build",
           f"*HaGeZi upstream version: {HAGEZI_VERSION} · source: {HAGEZI_SRC_NAME}*", "",
           "| Output | Format | Entries | Updated |",
@@ -661,23 +723,29 @@ def main() -> None:
           f"| `{OUT_HAGEZI}` | DOMAIN-SET | {len(hagezi_body)} | {ch_h} |",
           f"| `{OUT_MERGED}` | RULE-SET | {len(merged_body)} | {ch_m} |",
           f"| `{OUT_COMPLEMENT}` | RULE-SET | {len(comp_body)} | {ch_c} |",
-          f"| `{OUT_MODULE}` | module | {len(module_hosts)} MITM hostnames | {module_state} |",
+          f"| `{OUT_COMPLEMENT_EXTRA}` | RULE-SET | {len(comp_extra_body)} | {ch_x} |",
+          f"| `{OUT_MODULE}` | module | {len(module_hosts)} hostnames | {module_state} |",
           "", "#### Merged -> complement (rules already covered by Sukka removed)",
           "| Rule type | Merged | Complement | Removed |", "| --- | --- | --- | --- |"]
-    mc, cc = dict(counts(merged)), dict(counts(comp))
+    mc = dict(counts(merged))
+    cc = dict(counts(comp))
     for t in sorted(set(mc) | set(cc)):
         md.append(f"| {t} | {mc.get(t, 0)} | {cc.get(t, 0)} | {mc.get(t, 0) - cc.get(t, 0)} |")
-    md.append(f"| **total** | **{total_rules(merged)}** | **{total_rules(comp)}** | "
-              f"**{total_rules(merged) - total_rules(comp)}** |")
+    extra_total = total_rules(comp_extra)
+    md.append(f"| **total** | **{total_rules(merged)}** | **{comp_total}** | "
+              f"**{total_rules(merged) - comp_total}** |")
     md += ["", "#### Upstream parse stats",
-           "| Source | rules | IP literals | unusual | skipped refs |",
-           "| --- | --- | --- | --- | --- |"]
+           "| Source | rules | IP literals | unusual | skipped refs | line flags |",
+           "| --- | --- | --- | --- | --- | --- |"]
     for k in sorted(stats):
         s = stats[k]
-        md.append(f"| {k} | {s['lines']} | {s['ips']} | {s['unusual']} | {s['skipped']} |")
+        md.append(f"| {k} | {s['lines']} | {s['ips']} | {s['unusual']} | "
+                  f"{s['skipped']} | {s['flags']} |")
     if urlregex:
-        md += ["", f"URL-REGEX rules in complement: **{len(urlregex)}** "
-                   f"(MITM hostnames derived: **{len(module_hosts)}**)"]
+        md += ["", f"URL-REGEX in extra set: **{len(urlregex)}**, "
+                   f"MITM hostnames derived: **{len(module_hosts)}**"]
+    if extra_total:
+        md += ["", f"Extra set total: **{extra_total}** rules"]
     gh_summary("\n".join(md))
     print("build finished")
 
