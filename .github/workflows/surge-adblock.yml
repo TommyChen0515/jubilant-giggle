@@ -2,11 +2,8 @@ name: Auto Update Surge Ad-Block Rulesets
 
 on:
   schedule:
-    # HaGeZi publishes a new build roughly every 4-8h (03:00 / 11:00 / 19:00 UTC).
-    # Every 2 hours at an odd minute picks each build up quickly without
-    # competing for GitHub's busy top-of-the-hour slots.
     - cron: '23 */2 * * *'
-  workflow_dispatch:        # Adds a "Run workflow" button for manual runs
+  workflow_dispatch:
 
 concurrency:
   group: surge-adblock-update
@@ -18,20 +15,17 @@ jobs:
     timeout-minutes: 30
 
     permissions:
-      contents: write       # Lets the bot commit to your repo
+      contents: write
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v5
 
-      # =====================================================================
+      # ------------------------------------------------------------------
       # Step 1: download every upstream ruleset (each with mirrors).
-      # Everything lands in ./cache/. If ANY source fails after trying all of
-      # its mirrors the job aborts and the published rulesets stay untouched.
-      #
-      # The minimum entry counts are ~50% of today's sizes. They exist purely
-      # to catch truncated/corrupted downloads, not to police upstream.
-      # =====================================================================
+      # Any source that fails all mirrors aborts the run; published files
+      # are left untouched.
+      # ------------------------------------------------------------------
       - name: Download (with fallbacks) all upstream rulesets
         id: download
         run: |
@@ -49,7 +43,6 @@ jobs:
               if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
                     --connect-timeout 15 --max-time 300 --compressed \
                     -A "$UA" "$url" -o dl.tmp; then
-                # Reject HTML error/captcha pages served with HTTP 200
                 if head -c 4096 dl.tmp | grep -qiE '<(!doctype|html|head|body)'; then
                   echo "WARN: $key: got an HTML error page, trying next mirror"
                 else
@@ -72,7 +65,7 @@ jobs:
             return 1
           }
 
-          # HaGeZi Ultimate (wildcard/onlydomains)
+          # HaGeZi Ultimate
           fetch "HaGeZi Ultimate" hagezi.txt 100000 \
             "https://hagezi-mirror.dnsbunker.org/wildcard/ultimate-onlydomains.txt" \
             "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt" \
@@ -80,25 +73,25 @@ jobs:
             "https://codeberg.org/hagezi/mirror2/raw/branch/main/dns-blocklists/wildcard/ultimate-onlydomains.txt" \
             "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/ultimate-onlydomains.txt"
 
-          # (b) blackmatrix7 ad-block
+          # (b) blackmatrix7
           fetch "blackmatrix7 Advertising_All" blackmatrix.list 100000 \
             "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Surge/Advertising/Advertising_All.list" \
             "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Advertising/Advertising_All.list" \
             "https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Surge/Advertising/Advertising_All.list"
 
-          # (c) blackmatrix7 ad-block supplement (mickeu)
+          # (c) mickeu supplement
           fetch "mickeu Advertising_Supplement" mickeu.list 10 \
             "https://raw.githubusercontent.com/mickeu/surge/refs/heads/main/Rulesets/Advertising_Supplement.list" \
             "https://raw.githubusercontent.com/mickeu/surge/main/Rulesets/Advertising_Supplement.list" \
             "https://cdn.jsdelivr.net/gh/mickeu/surge@main/Rulesets/Advertising_Supplement.list"
 
-          # (d) 217Heidai ad-block for Surge (GitHub Releases asset + accelerators)
+          # (d) 217Heidai
           fetch "217heidai adblocksurge" heidai.txt 30000 \
             "https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list" \
             "https://gh-proxy.com/https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list" \
             "https://ghfast.top/https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list"
 
-          # (a) Sukka's ad-block rulesets
+          # (a) Sukka
           fetch "Sukka reject (domainset)" sukka_ds_reject.conf 80000 \
             "https://ruleset.skk.moe/List/domainset/reject.conf" \
             "https://ruleset-mirror.skk.moe/List/domainset/reject.conf" \
@@ -128,7 +121,6 @@ jobs:
             "https://ruleset-mirror.skk.moe/List/ip/reject.conf" \
             "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/ip/reject.conf"
 
-          # Upstream version from HaGeZi's header (blank -> unknown)
           HAGEZI_VERSION=$(grep -m1 -i '^# Version:' cache/hagezi.txt \
                              | sed 's/^# Version:[[:space:]]*//I' | tr -d '\r' || true)
           HAGEZI_VERSION="${HAGEZI_VERSION:-unknown}"
@@ -142,15 +134,6 @@ jobs:
             echo "src_url=$HAGEZI_SRC_URL"
           } >> "$GITHUB_OUTPUT"
 
-      # =====================================================================
-      # Step 2: parse, merge, de-duplicate, subtract Sukka's rules, write:
-      #   hagezi_ultimate.list                   -> Surge DOMAIN-SET (as before)
-      #   adblock_merged.list                    -> Surge RULE-SET (HaGeZi+b+c+d)
-      #   adblock_sukka_complement.list          -> Surge RULE-SET (merged - Sukka)
-      #   adblock_sukka_complement_mitm.sgmodule -> MITM hostnames for the
-      #                                             complement's URL-REGEX rules
-      # Abort conditions leave every published file untouched.
-      # =====================================================================
       - name: Build rulesets
         id: build
         env:
@@ -160,9 +143,6 @@ jobs:
           RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}
         run: python3 scripts/build_rules.py
 
-      # =====================================================================
-      # Step 3: commit & push (only when something actually changed)
-      # =====================================================================
       - name: Commit and Push Changes
         if: steps.build.outputs.changed == 'true'
         run: |
@@ -170,7 +150,6 @@ jobs:
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          # -A stages additions, modifications AND deletions of any output file
           git add -A
 
           if git diff --cached --quiet; then
@@ -178,9 +157,8 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Auto-update Surge ad-block rulesets - HaGeZi ${{ steps.build.outputs.version }} - merged ${{ steps.build.outputs.merged_count }} - Sukka-complement ${{ steps.build.outputs.complement_count }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          git commit -m "Auto-update Surge ad-block rulesets - HaGeZi ${{ steps.build.outputs.version }} - merged ${{ steps.build.outputs.merged_count }} - complement ${{ steps.build.outputs.complement_count }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
 
-          # Retry push in case another commit landed in between
           for i in 1 2 3; do
             git pull --rebase && git push && { echo "Rules updated and pushed!"; exit 0; }
             echo "Push attempt $i failed, retrying in 10s..."
