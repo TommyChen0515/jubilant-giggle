@@ -1,0 +1,6 @@
+#!name=AdBlock Complement (Sukka) - URL-REGEX MITM
+#!desc=Appends 24 MITM hostname entries derived from the 12 URL-REGEX rules in adblock_sukka_complement.list, so those rules can also match HTTPS requests. Install this module next to that RULE-SET, and generate + trust a MITM CA certificate in Surge first (Settings -> MitM -> Generate CA). Without the certificate the module does nothing.
+#!category=Ad Blocking
+
+[MITM]
+hostname = %APPEND% *.app.58.com, *.beacon.qq.com, *.cdn-1rtb.caiyunapp.com, *.com.cn, *.d.sina.com, *.d.sinaimg.cn, *.d.tuisong.baidu.com, *.gdt.qq.com, *.goblin.hupu.com, *.l.qq.com, *.sina.com.cn, *.update.pan.baidu.com, app.58.com, beacon.qq.com, cdn-1rtb.caiyunapp.com, com.cn, d.sina.com, d.sinaimg.cn, d.tuisong.baidu.com, gdt.qq.com, goblin.hupu.com, l.qq.com, sina.com.cn, update.pan.baidu.com

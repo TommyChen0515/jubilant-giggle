@@ -1,0 +1,37 @@
+# 广告拦截补充规则集（补充 Advertising_All 未覆盖的广告域名）
+
+# 微信广告域名
+DOMAIN-SUFFIX,adservice.weixin.qq.com
+DOMAIN-SUFFIX,adsdk.weixin.qq.com
+DOMAIN-SUFFIX,adclick.weixin.qq.com
+DOMAIN-SUFFIX,adclick.qq.com
+DOMAIN-SUFFIX,wxbhzyl.weixin.qq.com
+DOMAIN-SUFFIX,bzyapp.weixin.qq.com
+
+# 百度广告平台
+DOMAIN-SUFFIX,baiduadx.com
+DOMAIN-SUFFIX,baidumobads.com
+
+# 其他广告联盟/统计
+DOMAIN-SUFFIX,adsame.cn
+DOMAIN-SUFFIX,adsame1.cn
+DOMAIN-SUFFIX,mads.weather.com.cn
+# 阿里统计/广告监测（原在 Direct_Supplement 直连，改为拦截）
+DOMAIN-SUFFIX,mmstat.com
+
+# 恶意广告域名/IP（Advertising_All 漏掉）
+DOMAIN-SUFFIX,adsame.com
+IP-CIDR,111.175.220.163/32,no-resolve
+IP-CIDR,111.175.220.164/32,no-resolve
+IP-CIDR,175.6.223.15/32,no-resolve
+IP-CIDR,221.179.140.145/32,no-resolve
+
+# 京东广告域名（Advertising_All 仅收录 x.jd.com）
+DOMAIN-SUFFIX,ads1.jd.com
+DOMAIN-SUFFIX,ads.jd.com
+DOMAIN-SUFFIX,dsp.jd.com
+DOMAIN-SUFFIX,jdhmediajd.com
+DOMAIN-SUFFIX,media.jd.com
+
+# 银行恶意域名拦截
+DOMAIN,msmp.abchina.com.cn
