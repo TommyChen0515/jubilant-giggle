@@ -1,0 +1,190 @@
+name: Auto Update Surge Ad-Block Rulesets
+
+on:
+  schedule:
+    # HaGeZi publishes a new build roughly every 4-8h (03:00 / 11:00 / 19:00 UTC).
+    # Every 2 hours at an odd minute picks each build up quickly without
+    # competing for GitHub's busy top-of-the-hour slots.
+    - cron: '23 */2 * * *'
+  workflow_dispatch:        # Adds a "Run workflow" button for manual runs
+
+concurrency:
+  group: surge-adblock-update
+  cancel-in-progress: false
+
+jobs:
+  update-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write       # Lets the bot commit to your repo
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      # =====================================================================
+      # Step 1: download every upstream ruleset (each with mirrors).
+      # Everything lands in ./cache/. If ANY source fails after trying all of
+      # its mirrors the job aborts and the published rulesets stay untouched.
+      #
+      # The minimum entry counts are ~50% of today's sizes. They exist purely
+      # to catch truncated/corrupted downloads, not to police upstream.
+      # =====================================================================
+      - name: Download (with fallbacks) all upstream rulesets
+        id: download
+        run: |
+          set -euo pipefail
+          mkdir -p cache
+          UA="Mozilla/5.0 (GitHub Actions; Surge ad-block ruleset builder)"
+
+          fetch() {
+            local key="$1" file="$2" min="$3"
+            shift 3
+            local url n
+            for url in "$@"; do
+              echo "::group::$key <- $url"
+              rm -f dl.tmp
+              if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors \
+                    --connect-timeout 15 --max-time 300 --compressed \
+                    -A "$UA" "$url" -o dl.tmp; then
+                # Reject HTML error/captcha pages served with HTTP 200
+                if head -c 4096 dl.tmp | grep -qiE '<(!doctype|html|head|body)'; then
+                  echo "WARN: $key: got an HTML error page, trying next mirror"
+                else
+                  n=$(grep -cE '^[[:space:]]*[^#[:space:]/;]' dl.tmp || true)
+                  if [ "${n:-0}" -ge "$min" ]; then
+                    mv dl.tmp "cache/$file"
+                    printf '%s\n' "$url" > "cache/$file.src"
+                    echo "OK: $key: ${n} entries ($url)"
+                    echo "::endgroup::"
+                    return 0
+                  fi
+                  echo "WARN: $key: only ${n} entries (minimum $min), trying next mirror"
+                fi
+              else
+                echo "WARN: $key: download failed, trying next mirror"
+              fi
+              echo "::endgroup::"
+            done
+            echo "::error::$key: all mirrors failed - keeping existing rulesets unchanged"
+            return 1
+          }
+
+          # HaGeZi Ultimate (wildcard/onlydomains)
+          fetch "HaGeZi Ultimate" hagezi.txt 100000 \
+            "https://hagezi-mirror.dnsbunker.org/wildcard/ultimate-onlydomains.txt" \
+            "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt" \
+            "https://gitlab.com/hagezi/mirror/-/raw/main/dns-blocklists/wildcard/ultimate-onlydomains.txt" \
+            "https://codeberg.org/hagezi/mirror2/raw/branch/main/dns-blocklists/wildcard/ultimate-onlydomains.txt" \
+            "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/ultimate-onlydomains.txt"
+
+          # (b) blackmatrix7 ad-block
+          fetch "blackmatrix7 Advertising_All" blackmatrix.list 100000 \
+            "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Surge/Advertising/Advertising_All.list" \
+            "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Advertising/Advertising_All.list" \
+            "https://cdn.jsdelivr.net/gh/blackmatrix7/ios_rule_script@master/rule/Surge/Advertising/Advertising_All.list"
+
+          # (c) blackmatrix7 ad-block supplement (mickeu)
+          fetch "mickeu Advertising_Supplement" mickeu.list 10 \
+            "https://raw.githubusercontent.com/mickeu/surge/refs/heads/main/Rulesets/Advertising_Supplement.list" \
+            "https://raw.githubusercontent.com/mickeu/surge/main/Rulesets/Advertising_Supplement.list" \
+            "https://cdn.jsdelivr.net/gh/mickeu/surge@main/Rulesets/Advertising_Supplement.list"
+
+          # (d) 217Heidai ad-block for Surge (GitHub Releases asset + accelerators)
+          fetch "217heidai adblocksurge" heidai.txt 30000 \
+            "https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list" \
+            "https://gh-proxy.com/https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list" \
+            "https://ghfast.top/https://github.com/217heidai/adblockfilters/releases/download/rule/adblocksurge.list"
+
+          # (a) Sukka's ad-block rulesets
+          fetch "Sukka reject (domainset)" sukka_ds_reject.conf 80000 \
+            "https://ruleset.skk.moe/List/domainset/reject.conf" \
+            "https://ruleset-mirror.skk.moe/List/domainset/reject.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/domainset/reject.conf"
+          fetch "Sukka reject_extra (domainset)" sukka_ds_extra.conf 40000 \
+            "https://ruleset.skk.moe/List/domainset/reject_extra.conf" \
+            "https://ruleset-mirror.skk.moe/List/domainset/reject_extra.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/domainset/reject_extra.conf"
+          fetch "Sukka reject (non_ip)" sukka_nonip_reject.conf 50 \
+            "https://ruleset.skk.moe/List/non_ip/reject.conf" \
+            "https://ruleset-mirror.skk.moe/List/non_ip/reject.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/non_ip/reject.conf"
+          fetch "Sukka reject (url-regex)" sukka_nonip_urlregex.conf 30 \
+            "https://ruleset.skk.moe/List/non_ip/reject-url-regex.conf" \
+            "https://ruleset-mirror.skk.moe/List/non_ip/reject-url-regex.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/non_ip/reject-url-regex.conf"
+          fetch "Sukka reject-no-drop" sukka_nonip_nodrop.conf 5 \
+            "https://ruleset.skk.moe/List/non_ip/reject-no-drop.conf" \
+            "https://ruleset-mirror.skk.moe/List/non_ip/reject-no-drop.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/non_ip/reject-no-drop.conf"
+          fetch "Sukka reject-drop" sukka_nonip_drop.conf 5 \
+            "https://ruleset.skk.moe/List/non_ip/reject-drop.conf" \
+            "https://ruleset-mirror.skk.moe/List/non_ip/reject-drop.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/non_ip/reject-drop.conf"
+          fetch "Sukka reject (ip)" sukka_ip_reject.conf 100 \
+            "https://ruleset.skk.moe/List/ip/reject.conf" \
+            "https://ruleset-mirror.skk.moe/List/ip/reject.conf" \
+            "https://cdn.jsdelivr.net/gh/SukkaLab/ruleset.skk.moe@master/List/ip/reject.conf"
+
+          # Upstream version from HaGeZi's header (blank -> unknown)
+          HAGEZI_VERSION=$(grep -m1 -i '^# Version:' cache/hagezi.txt \
+                             | sed 's/^# Version:[[:space:]]*//I' | tr -d '\r' || true)
+          HAGEZI_VERSION="${HAGEZI_VERSION:-unknown}"
+          HAGEZI_SRC_URL=$(cat cache/hagezi.txt.src 2>/dev/null || echo "-")
+          HAGEZI_SRC_NAME=$(printf '%s' "$HAGEZI_SRC_URL" | sed -E 's#^https?://([^/]+)/.*$#\1#')
+          HAGEZI_SRC_NAME="${HAGEZI_SRC_NAME:-mirror}"
+
+          {
+            echo "version=$HAGEZI_VERSION"
+            echo "src_name=$HAGEZI_SRC_NAME"
+            echo "src_url=$HAGEZI_SRC_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      # =====================================================================
+      # Step 2: parse, merge, de-duplicate, subtract Sukka's rules, write:
+      #   hagezi_ultimate.list                   -> Surge DOMAIN-SET (as before)
+      #   adblock_merged.list                    -> Surge RULE-SET (HaGeZi+b+c+d)
+      #   adblock_sukka_complement.list          -> Surge RULE-SET (merged - Sukka)
+      #   adblock_sukka_complement_mitm.sgmodule -> MITM hostnames for the
+      #                                             complement's URL-REGEX rules
+      # Abort conditions leave every published file untouched.
+      # =====================================================================
+      - name: Build rulesets
+        id: build
+        env:
+          HAGEZI_VERSION:  ${{ steps.download.outputs.version }}
+          HAGEZI_SRC_NAME: ${{ steps.download.outputs.src_name }}
+          HAGEZI_SRC_URL:  ${{ steps.download.outputs.src_url }}
+          RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}
+        run: python3 scripts/build_rules.py
+
+      # =====================================================================
+      # Step 3: commit & push (only when something actually changed)
+      # =====================================================================
+      - name: Commit and Push Changes
+        if: steps.build.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # -A stages additions, modifications AND deletions of any output file
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes, nothing to push."
+            exit 0
+          fi
+
+          git commit -m "Auto-update Surge ad-block rulesets - HaGeZi ${{ steps.build.outputs.version }} - merged ${{ steps.build.outputs.merged_count }} - Sukka-complement ${{ steps.build.outputs.complement_count }} ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+
+          # Retry push in case another commit landed in between
+          for i in 1 2 3; do
+            git pull --rebase && git push && { echo "Rules updated and pushed!"; exit 0; }
+            echo "Push attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Failed to push after 3 attempts."
+          exit 1
