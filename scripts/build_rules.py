@@ -15,6 +15,16 @@ Published outputs (repo root):
   adblock_sukka_complement_mitm.sgmodule   Surge module, [MITM] %APPEND% hostnames
                                            for the URL-REGEX rules above
 
+Two user-controlled inputs shape the result:
+
+  exclusions.list (EXCLUDE_FILE)   user allowlist; a host listed there is never
+                                   blocked by any generated output. DOT-prefixed
+                                   (.host) also unblocks its subdomains.
+  DEDUPE_FILES                     extra rule files whose content is subtracted
+                                   from the complement as well, so the same host
+                                   is not published twice when several sets are
+                                   loaded in Surge at once.
+
 Standard library only. Every file is validated against Surge's documented
 rule-set syntax before anything is written; any validation failure aborts the
 run and leaves previously published files untouched.
@@ -36,6 +46,16 @@ OUT_MERGED = "adblock_merged.list"
 OUT_COMPLEMENT = "adblock_sukka_complement.list"
 OUT_COMPLEMENT_EXTRA = "adblock_sukka_complement_extra.list"
 OUT_MODULE = "adblock_sukka_complement_mitm.sgmodule"
+
+# ------------------------------------------------- user-controlled adjustments
+# Hosts that must never be blocked, even when an upstream list contains them.
+OUT_EXCLUDE = os.environ.get("EXCLUDE_FILE", "exclusions.list")
+# Extra rule files whose content is subtracted from the complement, so rules that
+# would be loaded twice (e.g. our own DOMAIN-SET in the Surge profile) are dropped.
+DEDUPE_FILES = [p.strip() for p in
+                os.environ.get("DEDUPE_FILES", "Adblock_Supplement.list").split(",")
+                if p.strip()]
+
 
 # ----------------------------------------------------------------------- gates
 HAGEZI_MAX_UNUSUAL = 1000
@@ -294,6 +314,184 @@ def total_rules(r: dict) -> int:
             + len(r["wc"]) + len(r["ips"]) + len(r["other"]))
 
 
+# ------------------------------------------------------- exclusions (allowlist)
+def wildcard_hits(pattern: str, hosts: set[str]) -> bool:
+    """True when a DOMAIN-WILDCARD pattern can still match one of the hosts."""
+    rx = re.compile(fnmatch.translate(pattern), re.I)
+    return any(rx.match(h) for h in hosts)
+
+
+def load_exclusion_file(path: str) -> dict:
+    """User allowlist in DOMAIN-SET syntax.
+
+    '.d' / '+.d' / '*.d' unblocks d and every subdomain of d.
+    A bare 'd' unblocks exactly that host.
+    """
+    ex = new_rules()
+    if not os.path.isfile(path):
+        warn(f"{path} not found - no exclusions applied")
+        return ex
+    parse_domain_file(path, "exclusions", ex, False)
+    ex["exact"] -= ex["suffix"]
+    print(f"{path}: {len(ex['suffix'])} host(s) with subdomains and "
+          f"{len(ex['exact'])} exact host(s) unblocked")
+    return ex
+
+
+def blocking_hit(host: str, r: dict) -> bool:
+    """Does any rule in r block this host? (used to spot typos in the allowlist)"""
+    if host in r["suffix"] or host in r["exact"] or parent_in(host, r["suffix"]):
+        return True
+    if any(k.lower() in host for k in r["kw"]):
+        return True
+    return any(wildcard_hits(w, {host}) for w in r["wc"])
+
+
+def unblock(r: dict, ex: dict) -> set[str]:
+    """Remove every rule in r that would still cover an excluded host.
+
+    Returns the excluded hosts that were actually blocked by r, so the caller can
+    warn about allowlist entries that match nothing (typo or already dropped
+    upstream) instead of letting them rot unnoticed.
+    """
+    suf, exact = ex["suffix"], ex["exact"]
+    hosts = suf | exact
+    present = {h for h in hosts if blocking_hit(h, r)}
+    r["suffix"] = {s for s in r["suffix"] if s not in suf and not parent_in(s, suf)}
+    r["exact"] = {e for e in r["exact"]
+                  if e not in suf and e not in exact and not parent_in(e, suf)}
+    r["wc"] = {w for w in r["wc"] if not wildcard_hits(w, hosts)}
+    # A keyword cannot be excepted, so it has to go as a whole; say so loudly.
+    killed = sorted(k for k in r["kw"] if any(k.lower() in h for h in hosts))
+    if killed:
+        warn("unblocking an excluded host also drops DOMAIN-KEYWORD rule(s): "
+             + ", ".join(killed[:10]))
+        r["kw"] -= set(killed)
+    return present
+
+
+# ----------------------------------------------------------- rule-set coverage
+RE_TAIL = re.compile(r"(?:\.\*)?\$*$")
+
+
+def canon_regex(v: str) -> str:
+    """Same pattern written two ways must compare equal: \\/ vs /, \\. vs ., case."""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1]
+    return v.replace("\\/", "/").replace("\\.", ".").lower()
+
+
+def regex_already_covered(ours: str, prior: set[str]) -> bool:
+    """True when a prior pattern matches at least everything ours matches."""
+    o = canon_regex(ours)
+    if o in prior:
+        return True
+    # ours ends in ".*$" -> the same pattern without that tail matches a superset
+    trimmed = RE_TAIL.sub("", o)
+    return trimmed != o and trimmed in prior
+
+
+class Coverage:
+    """Union of rule sets: answers 'would this set already block domain X?'."""
+
+    def __init__(self, *sets: dict) -> None:
+        self.suffix: set[str] = set()
+        self.exact: set[str] = set()
+        self.kw: set[str] = set()
+        self.wc: set[str] = set()
+        self.other: set[tuple] = set()
+        self.ips: list = []
+        for s in sets:
+            self.suffix |= s["suffix"]
+            self.exact |= s["exact"]
+            self.kw |= s["kw"]
+            self.wc |= s["wc"]
+            self.other |= s["other"]
+            self.ips.extend(s["ips"])
+        self.wc_rx = [(w, re.compile(fnmatch.translate(w), re.I)) for w in self.wc]
+        self.other_norm = {canon_regex(v) for (_t, v, _e) in self.other}
+
+    def covers_other(self, rule: tuple) -> bool:
+        rtype, value, _extra = rule
+        if rule in self.other:
+            return True
+        if rtype == "URL-REGEX":
+            return regex_already_covered(value, self.other_norm)
+        return False
+
+    def covers_domain(self, d: str, is_suffix: bool) -> bool:
+        if parent_in(d, self.suffix, include_self=True):
+            return True
+        if not is_suffix and d in self.exact:
+            return True
+        if any(k.lower() in d for k in self.kw):
+            return True
+        if not is_suffix and any(rx.match(d) for _w, rx in self.wc_rx):
+            return True
+        return False
+
+    def covers_keyword(self, k: str) -> bool:
+        return k in self.kw or any(pk in k for pk in self.kw)
+
+    def covers_wildcard(self, w: str) -> bool:
+        if w in self.wc:
+            return True
+        return w.startswith("*.") and parent_in(w[2:], self.suffix, include_self=True)
+
+    def covers_ip(self, n) -> bool:
+        return any(m.version == n.version and n.subnet_of(m) for m in self.ips)
+
+
+def subtract(src: dict, cov: Coverage) -> dict:
+    out = new_rules()
+    out["suffix"] = {s for s in src["suffix"] if not cov.covers_domain(s, True)}
+    out["exact"] = {e for e in src["exact"] if not cov.covers_domain(e, False)}
+    out["kw"] = {k for k in src["kw"] if not cov.covers_keyword(k)}
+    out["wc"] = {w for w in src["wc"] if not cov.covers_wildcard(w)}
+    out["ips"] = {n for n in src["ips"] if not cov.covers_ip(n)}
+    out["other"] = {o for o in src["other"] if not cov.covers_other(o)}
+    return out
+
+
+def parse_any_file(path: str, key: str, r: dict) -> None:
+    """Parse a RULE-SET or a DOMAIN-SET by looking at its first real line."""
+    ruleset = False
+    for line in iter_lines(path):
+        s = line.strip()
+        if not s or s[0] in "#;/!" or s.startswith("["):
+            continue
+        m = RULE_LINE.match(s)
+        ruleset = bool(m and m.group(1).upper() in (EMIT_TYPES | REF_TYPES))
+        break
+    if ruleset:
+        parse_ruleset_file(path, key, r)
+    else:
+        parse_domain_file(path, key, r, False)
+
+
+def rules_matching_host(host: str, body: list[str]) -> list[str]:
+    """Post-build guard: which rendered rules would still block this host?"""
+    hits: list[str] = []
+    for line in body:
+        m = RULE_LINE.match(line)
+        if not m:
+            continue
+        rtype = m.group(1).upper()
+        value = m.group(2).split(",")[0].strip().strip('"')
+        if rtype == "DOMAIN" and value == host:
+            hits.append(line)
+        elif rtype == "DOMAIN-SUFFIX" and (host == value or host.endswith("." + value)):
+            hits.append(line)
+        elif rtype == "DOMAIN-KEYWORD" and value and value.lower() in host:
+            hits.append(line)
+        elif rtype == "DOMAIN-WILDCARD" and wildcard_hits(value, {host}):
+            hits.append(line)
+        elif rtype in LOGICAL_TYPES and host in m.group(2):
+            hits.append(line)
+    return hits
+
+
 # -------------------------------------------------------------------- rendering
 def quote_value(v: str) -> str:
     return f'"{v}"' if "," in v else v
@@ -403,6 +601,16 @@ BAD_TLDS = {
 }
 MITM_HOST_RE = re.compile(r"^(?:\*\.)?[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9_])?$")
 
+# Second-level public suffixes: a two-label token that IS one of these is not a
+# host but a fragment of a longer pattern, and MITM-ing it would intercept an
+# entire national namespace (e.g. *.com.cn = every Chinese company site).
+PUBLIC_SUFFIX = {
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "com.hk", "com.tw", "com.mo", "co.jp", "co.kr", "com.sg", "com.au",
+    "co.nz", "com.br", "com.ru", "co.uk", "org.uk", "ac.uk", "com.my",
+    "co.id", "in.th", "com.vn", "co.th", "com.ph", "co.in", "com.mx",
+}
+
 
 def mitm_hostnames(regex_values: list[str]) -> set[str]:
     found: set[str] = set()
@@ -416,6 +624,8 @@ def mitm_hostnames(regex_values: list[str]) -> set[str]:
         if len(labels) < 2 or any(not lbl for lbl in labels):
             continue
         if labels[-1] in BAD_TLDS or len(labels[-1]) < 2:
+            continue
+        if ".".join(labels) in PUBLIC_SUFFIX:
             continue
         if all(lbl.isdigit() for lbl in labels):
             continue
@@ -493,11 +703,34 @@ def strip_body(path: str):
         return [ln.rstrip("\n") for ln in f if ln.strip() and not ln.startswith("#")]
 
 
+HDR_TIME = re.compile(r"^#\s*Last modified\s*:", re.I)
+
+
+def read_header(path: str) -> list[str]:
+    """Leading comment lines of a previously written file (empty when absent)."""
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.rstrip("\r\n")
+            if not s.startswith("#"):
+                break
+            out.append(s)
+    return out
+
+
 def write_if_changed(path: str, header: list[str], body: list[str]) -> bool:
     old = strip_body(path)
     if old is not None and old == body:
-        print(f"{path}: rule body unchanged - keeping existing file")
-        return False
+        # Compare the header too, ignoring the timestamp, so corrected header
+        # text still reaches the published file without a commit every run.
+        old_hdr = [h for h in read_header(path) if not HDR_TIME.match(h)]
+        new_hdr = [h for h in header if not HDR_TIME.match(h)]
+        if old_hdr == new_hdr:
+            print(f"{path}: unchanged - keeping existing file")
+            return False
+        print(f"{path}: header updated ({len(body)} rules unchanged)")
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(header) + "\n")
@@ -577,38 +810,38 @@ def main() -> None:
     if len(sukka["suffix"]) + len(sukka["exact"]) < SUKKA_MIN_DOMAINS:
         die("Sukka rulesets look truncated - aborting")
 
+    # ---- user adjustments ----------------------------------------------
+    excluded = load_exclusion_file(OUT_EXCLUDE)
+    priors: list[dict] = []
+    prior_info: list[tuple[str, int]] = []
+    for path in DEDUPE_FILES:
+        if not os.path.isfile(path):
+            print(f"dedupe source {path} not found - skipped")
+            continue
+        extra = new_rules()
+        parse_any_file(path, f"dedupe:{os.path.basename(path)}", extra)
+        priors.append(extra)
+        prior_info.append((path, total_rules(extra)))
+        print(f"dedupe source {path}: {total_rules(extra)} rule(s) "
+              "subtracted from the complement")
+
     # ---- merged = HaGeZi + b + c + d -----------------------------------
     merged = new_rules()
     merge_rules(merged, hagezi, bm, mk, hd)
+    if excluded["suffix"] or excluded["exact"]:
+        before = total_rules(merged)
+        present = unblock(merged, excluded)
+        print(f"exclusions removed {before - total_rules(merged)} merged rule(s)")
+        unused = sorted((excluded["suffix"] | excluded["exact"]) - present)
+        if unused:
+            warn(f"{len(unused)} allowlist host(s) match nothing in the upstream "
+                 "lists (typo, or the upstream already dropped them): "
+                 + ", ".join(unused[:10]))
     collapse(merged)
 
-    # ---- complement = merged - Sukka -----------------------------------
-    kw = list(sukka["kw"])
-    wc_rx = [(w, re.compile(fnmatch.translate(w))) for w in sukka["wc"]]
-    s_suf, s_ex, s_ips = sukka["suffix"], sukka["exact"], list(sukka["ips"])
-
-    def covered_by_sukka(d: str, is_suffix: bool) -> bool:
-        if parent_in(d, s_suf, include_self=True):
-            return True
-        if not is_suffix and d in s_ex:
-            return True
-        for k in kw:
-            if k in d:
-                return True
-        if not is_suffix:
-            for _w, rx in wc_rx:
-                if rx.fullmatch(d):
-                    return True
-        return False
-
-    comp = new_rules()
-    comp["suffix"] = {s for s in merged["suffix"] if not covered_by_sukka(s, True)}
-    comp["exact"] = {e for e in merged["exact"] if not covered_by_sukka(e, False)}
-    comp["kw"] = {k for k in merged["kw"] if not any(sk == k or sk in k for sk in kw)}
-    comp["wc"] = merged["wc"] - sukka["wc"]
-    comp["ips"] = {n for n in merged["ips"]
-                   if not any(m.version == n.version and n.subnet_of(m) for m in s_ips)}
-    comp["other"] = {o for o in merged["other"] if o not in sukka["other"]}
+    # ---- complement = merged - (Sukka + local sets) --------------------
+    cov = Coverage(sukka, *priors)
+    comp = subtract(merged, cov)
 
     # Split out the types Surge cannot use in the pre-matching phase.
     comp_extra = new_rules()
@@ -623,9 +856,11 @@ def main() -> None:
     if comp_total < COMPLEMENT_MIN_RULES:
         die(f"complement only has {comp_total} rules "
             f"(expected >= {COMPLEMENT_MIN_RULES}) - subtraction may be wrong - aborting")
-    leftover = (comp["suffix"] & s_suf) | (comp["exact"] & s_ex)
+    leftover = ([s for s in comp["suffix"] if cov.covers_domain(s, True)]
+                + [e for e in comp["exact"] if cov.covers_domain(e, False)])
     if leftover:
-        die(f"subtraction incomplete: {len(leftover)} rules still duplicate Sukka entries")
+        die(f"subtraction incomplete: {len(leftover)} rules still duplicate a "
+            "prior set (Sukka or DEDUPE_FILES) - aborting")
 
     # ---- render + validate before touching anything --------------------
     hagezi_body = sorted("." + d for d in (hagezi["suffix"] | hagezi["exact"]))
@@ -637,6 +872,25 @@ def main() -> None:
     validate_rules_body(merged_body, OUT_MERGED)
     validate_rules_body(comp_body, OUT_COMPLEMENT)
     validate_rules_body(comp_extra_body, OUT_COMPLEMENT_EXTRA)
+
+    # ---- exclusion guard: an excluded host must not survive in any output
+    still_blocked: list[str] = []
+    for host in sorted(excluded["suffix"] | excluded["exact"]):
+        hit = (rules_matching_host(host, comp_body)
+               or rules_matching_host(host, comp_extra_body)
+               or rules_matching_host(host, merged_body))
+        if hit:
+            still_blocked.append(f"{host} <- {hit[0]}")
+    if still_blocked:
+        for s in still_blocked[:20]:
+            print(f"::error::excluded host still blocked: {s}", flush=True)
+        die(f"{len(still_blocked)} excluded host(s) would still be blocked "
+            "(an ancestor DOMAIN-SUFFIX, a DOMAIN-KEYWORD or a logical upstream "
+            "rule covers them, or the profile still loads " + OUT_HAGEZI +
+            ") - nothing written")
+    if excluded["suffix"] or excluded["exact"]:
+        print(f"exclusion guard: {len(excluded['suffix'] | excluded['exact'])} "
+              "host(s) verified free of blocking rules")
 
     # ---- write ---------------------------------------------------------
     ch_h = write_if_changed(OUT_HAGEZI, [
@@ -666,7 +920,7 @@ def main() -> None:
         "#",
     ], merged_body)
 
-    ch_c = write_if_changed(OUT_COMPLEMENT, [
+    comp_header = [
         "# Title: Ad-Block complement to Sukka's rulesets - main set (Surge RULE-SET)",
         "# Description: (HaGeZi Ultimate + blackmatrix7 Advertising_All + mickeu",
         "#              Advertising_Supplement + 217heidai adblocksurge) minus every rule",
@@ -679,10 +933,17 @@ def main() -> None:
         "# All entries here are domain/IP/logical/port rules, so this set may also",
         "# carry the pre-matching flag (REJECT-family policy required).",
         f"# Companion file (URL-REGEX etc., cannot use pre-matching): {OUT_COMPLEMENT_EXTRA}",
-        f"# Entries: {counts_str(comp)}",
-        f"# Number of entries: {len(comp_body)}",
-        "#",
-    ], comp_body)
+    ]
+    if prior_info:
+        comp_header.append("# Dedupe sources also subtracted: "
+                           + ", ".join(p for p, _n in prior_info))
+    if excluded["suffix"] or excluded["exact"]:
+        comp_header.append(f"# Exclusions applied ({OUT_EXCLUDE}): "
+                           f"{len(excluded['suffix'] | excluded['exact'])} host(s) unblocked")
+    comp_header += [f"# Entries: {counts_str(comp)}",
+                    f"# Number of entries: {len(comp_body)}",
+                    "#"]
+    ch_c = write_if_changed(OUT_COMPLEMENT, comp_header, comp_body)
 
     ch_x = False
     if comp_extra_body:
@@ -741,6 +1002,18 @@ def main() -> None:
         s = stats[k]
         md.append(f"| {k} | {s['lines']} | {s['ips']} | {s['unusual']} | "
                   f"{s['skipped']} | {s['flags']} |")
+    if excluded["suffix"] or excluded["exact"]:
+        md += ["", "#### Exclusions (`" + OUT_EXCLUDE + "`)",
+               f"* {len(excluded['suffix'])} host(s) unblocked including subdomains, "
+               f"{len(excluded['exact'])} exact host(s); verified absent from "
+               f"`{OUT_COMPLEMENT}`, `{OUT_COMPLEMENT_EXTRA}` and `{OUT_MERGED}`.",
+               "* `" + OUT_HAGEZI + "` stays a byte-faithful upstream mirror, so it still "
+               "contains them - do not load it as a rule-set if you need exclusions."]
+    if priors:
+        md += ["", "#### Dedupe sources subtracted from the complement",
+               "| Source | rules |", "| --- | --- |"]
+        for path, n in prior_info:
+            md.append(f"| `{path}` | {n} |")
     if urlregex:
         md += ["", f"URL-REGEX in extra set: **{len(urlregex)}**, "
                    f"MITM hostnames derived: **{len(module_hosts)}**"]
